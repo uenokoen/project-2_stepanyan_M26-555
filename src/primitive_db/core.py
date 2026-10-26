@@ -1,5 +1,14 @@
+from primitive_db.decorators import (
+    confirm_action,
+    create_cacher,
+    handle_db_errors,
+    log_time,
+)
+
 VALID_TYPES = {"int", "str", "bool"}
 TYPES = {"int": int, "str": str, "bool": bool}
+
+select_cache = create_cacher()
 
 
 def format_columns(columns):
@@ -7,6 +16,7 @@ def format_columns(columns):
     return ", ".join(f"{name}:{type_}" for name, type_ in columns.items())
 
 
+@handle_db_errors
 def create_table(metadata, table_name, columns):
     """Создаёт таблицу с указанными столбцами и столбцом ID:int в начале."""
     if table_name in metadata:
@@ -19,8 +29,7 @@ def create_table(metadata, table_name, columns):
         if name == "ID" and column_type == "int":
             continue
         if not name or column_type not in VALID_TYPES or name in table_columns:
-            print(f"Некорректное значение: {column}. Попробуйте снова.")
-            return metadata
+            raise ValueError(column)
         table_columns[name] = column_type
 
     metadata[table_name] = table_columns
@@ -29,12 +38,10 @@ def create_table(metadata, table_name, columns):
     return metadata
 
 
+@handle_db_errors
+@confirm_action("удаление таблицы")
 def drop_table(metadata, table_name):
     """Удаляет таблицу из метаданных."""
-    if table_name not in metadata:
-        print(f'Ошибка: Таблица "{table_name}" не существует.')
-        return metadata
-
     del metadata[table_name]
     print(f'Таблица "{table_name}" успешно удалена.')
     return metadata
@@ -59,10 +66,8 @@ def is_valid_type(value, column_type):
 def check_clause(columns, clause):
     """Проверяет, что столбцы из условия есть в таблице и типы значений верные."""
     for column, value in clause.items():
-        if column not in columns or not is_valid_type(value, columns[column]):
-            print(f"Некорректное значение: {column} = {value}. Попробуйте снова.")
-            return False
-    return True
+        if not is_valid_type(value, columns[column]):
+            raise ValueError(f"{column} = {value}")
 
 
 def matches(row, where_clause):
@@ -70,25 +75,25 @@ def matches(row, where_clause):
     return all(row.get(column) == value for column, value in where_clause.items())
 
 
+def find_ids(table_data, where_clause):
+    """Возвращает ID записей, подходящих под условие."""
+    return [row["ID"] for row in table_data if matches(row, where_clause)]
+
+
+@handle_db_errors
+@log_time
 def insert(metadata, table_name, values, table_data):
     """Добавляет запись в таблицу. ID генерируется автоматически."""
-    if table_name not in metadata:
-        print(f'Ошибка: Таблица "{table_name}" не существует.')
-        return table_data
-
     columns = list(metadata[table_name].items())[1:]
     if len(values) != len(columns):
-        print(
-            f"Некорректное значение: ожидается {len(columns)} значений, "
-            f"получено {len(values)}. Попробуйте снова."
+        raise ValueError(
+            f"ожидается {len(columns)} значений, получено {len(values)}"
         )
-        return table_data
 
     record = {"ID": max((row["ID"] for row in table_data), default=0) + 1}
     for (column, column_type), value in zip(columns, values):
         if not is_valid_type(value, column_type):
-            print(f"Некорректное значение: {value}. Попробуйте снова.")
-            return table_data
+            raise ValueError(value)
         record[column] = value
 
     table_data.append(record)
@@ -96,20 +101,31 @@ def insert(metadata, table_name, values, table_data):
     return table_data
 
 
+@handle_db_errors
+@log_time
 def select(table_data, where_clause=None):
     """Возвращает все записи или только подходящие под условие."""
     if not where_clause:
         return table_data
-    return [row for row in table_data if matches(row, where_clause)]
+
+    # В ключе есть и данные таблицы: если они изменятся, ключ будет другим
+    key = (str(where_clause), str(table_data))
+    return select_cache(
+        key, lambda: [row for row in table_data if matches(row, where_clause)]
+    )
 
 
+@handle_db_errors
 def update(table_data, set_clause, where_clause):
     """Обновляет поля в записях, подходящих под условие."""
-    for row in select(table_data, where_clause):
-        row.update(set_clause)
+    for row in table_data:
+        if matches(row, where_clause):
+            row.update(set_clause)
     return table_data
 
 
+@handle_db_errors
+@confirm_action("удаление записи")
 def delete(table_data, where_clause):
     """Удаляет записи, подходящие под условие."""
     return [row for row in table_data if not matches(row, where_clause)]
